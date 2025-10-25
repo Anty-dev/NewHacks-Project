@@ -12,11 +12,15 @@ from plaid.model.sandbox_public_token_create_request import SandboxPublicTokenCr
 from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
 
 
+<<<<<<< HEAD
 
 dotenv_path = Path("Keys.env")
 load_dotenv(dotenv_path)
 
 ## Section 1
+=======
+load_dotenv()
+>>>>>>> 57fef449755318adc75d29fd0a28556d97046146
 
 client_id = os.getenv("PLAID_CLIENT_ID")
 secret = os.getenv("PLAID_APIKEY")
@@ -28,6 +32,7 @@ configuration = Configuration(
 )
 
 client = plaid_api.PlaidApi(ApiClient(configuration))
+<<<<<<< HEAD
 
 # print("test")
 #print("client_id:", client_id)
@@ -149,3 +154,5 @@ response = model.generate_content(prompt)
 print("The response is ")
 print("---------------------")
 print(response.text)
+=======
+>>>>>>> 57fef449755318adc75d29fd0a28556d97046146

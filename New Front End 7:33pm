@@ -1,0 +1,487 @@
+# app.py
+"""
+Budget Buddy — Futuristic Fintech (front-end)
+- Split view: Dashboard (left) + AI / Controls (right)
+- Integrates with Plaid Sandbox when PLAID_CLIENT_ID/PLAID_SECRET present in .env
+- Optional Gemini integration via GENAI_API_KEY (google.generativeai)
+- Fallback upload for CSV/JSON if Plaid unavailable
+"""
+
+import os
+from dotenv import load_dotenv
+load_dotenv("Keys.env")  # change filename if needed
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+import plotly.graph_objects as go
+import requests
+import json
+from datetime import datetime, timedelta
+from dateutil import parser
+from streamlit_lottie import st_lottie
+
+# Try import Plaid SDK; if not installed, show clear message
+try:
+    from plaid.api import plaid_api
+    from plaid.model.products import Products
+    from plaid.model.sandbox_public_token_create_request import SandboxPublicTokenCreateRequest
+    from plaid.model.transactions_get_request import TransactionsGetRequest
+    from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
+    from plaid.api_client import ApiClient
+    from plaid.configuration import Configuration
+    PLAID_AVAILABLE = True
+except Exception:
+    PLAID_AVAILABLE = False
+
+# Optional Gemini (google generative ai)
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except Exception:
+    GEMINI_AVAILABLE = False
+
+# ---------------------------
+# Config + secrets
+# ---------------------------
+st.set_page_config(page_title="Budget Buddy — Vibe", page_icon="💸", layout="wide")
+PLAID_CLIENT_ID = os.getenv("PLAID_CLIENT_ID")
+PLAID_SECRET = os.getenv("PLAID_SECRET")
+PLAID_ENV = os.getenv("PLAID_ENV", "sandbox")  # default sandbox
+GENAI_API_KEY = os.getenv("GENAI_API_KEY") or os.getenv("G")
+
+# ---------------------------
+# Styling (futuristic)
+# ---------------------------
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;600;700&display=swap');
+    :root {
+      --neon: #6C5CE7;
+      --neon2: #00F5A0;
+      --glass: rgba(255,255,255,0.04);
+      --bg: linear-gradient(180deg,#050816 0%, #07102a 60%);
+    }
+    html, body, .streamlit-container {
+      background: var(--bg);
+      color: #dbeafe;
+      font-family: 'Poppins', sans-serif;
+    }
+    .glass {
+      background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+      border: 1px solid rgba(255,255,255,0.04);
+      border-radius: 14px;
+      padding: 18px;
+      box-shadow: 0 8px 40px rgba(0,0,0,0.6);
+    }
+    .muted { color: #9aa8c2; font-size:13px; }
+    .kpi { padding:12px; border-radius:10px; background: linear-gradient(90deg, rgba(255,255,255,0.01), rgba(255,255,255,0.02)); }
+    .neon-btn {
+      background: linear-gradient(90deg, var(--neon), #00d2ff);
+      color: black;
+      padding: 8px 14px;
+      border-radius: 10px;
+      font-weight: 600;
+      border: none;
+    }
+    .small { font-size:13px; color:#9aa8c2; }
+    hr { border: 0; border-top: 1px solid rgba(255,255,255,0.04); margin:14px 0; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def load_lottie_url(url):
+    try:
+        r = requests.get(url, timeout=4)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
+
+def currency(v):
+    try:
+        return f"${v:,.2f}"
+    except:
+        return str(v)
+
+def normalize_transactions(raw):
+    # Accept list/dict/df or pasted JSON
+    rows = []
+    if isinstance(raw, pd.DataFrame):
+        rows = raw.to_dict(orient="records")
+    elif isinstance(raw, list):
+        rows = raw
+    else:
+        # try parse
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                rows = parsed
+            elif isinstance(parsed, dict) and "transactions" in parsed:
+                rows = parsed["transactions"]
+            else:
+                rows = [parsed]
+        except Exception:
+            rows = []
+
+    normalized = []
+    for t in rows:
+        merchant = None
+        if isinstance(t.get("merchant_name"), list):
+            merchant = t.get("merchant_name")[0] if t.get("merchant_name") else None
+        elif t.get("merchant_name"):
+            merchant = t.get("merchant_name")
+        elif t.get("name"):
+            merchant = t.get("name")
+        else:
+            merchant = t.get("merchant") or "Uncategorized"
+
+        category = t.get("category") or t.get("category_name") or "Uncategorized"
+
+        try:
+            amt = float(t.get("amount", 0))
+        except:
+            amt = 0.0
+
+        d = t.get("date")
+        try:
+            date_parsed = parser.parse(str(d)) if d else None
+        except:
+            date_parsed = None
+
+        normalized.append({
+            "date": date_parsed,
+            "merchant_name": merchant,
+            "category": category,
+            "amount": amt,
+            "_raw": t
+        })
+    return normalized
+
+def compute_spending_by_merchant(tx_list):
+    totals = {}
+    for t in tx_list:
+        m = t.get("merchant_name")
+        if isinstance(m, list):
+            key = m[0] if m else "Uncategorized"
+        elif m:
+            key = m
+        elif t.get("name"):
+            key = t.get("name")
+        else:
+            key = "Uncategorized"
+        try:
+            amt = float(t.get("amount", 0))
+        except:
+            amt = 0.0
+        totals[key] = totals.get(key, 0.0) + amt
+    return totals
+
+# ---------------------------
+# Plaid helpers (sandbox flow)
+# ---------------------------
+def init_plaid_client():
+    if not PLAID_AVAILABLE:
+        raise RuntimeError("Plaid SDK not installed (pip install plaid-python).")
+    if not PLAID_CLIENT_ID or not PLAID_SECRET:
+        raise RuntimeError("PLAID_CLIENT_ID and PLAID_SECRET not set in Keys.env.")
+    config = Configuration(
+        host="https://sandbox.plaid.com",
+        api_key={"clientId": PLAID_CLIENT_ID, "secret": PLAID_SECRET}
+    )
+    return plaid_api.PlaidApi(ApiClient(config))
+
+def create_sandbox_public_token(client):
+    # example sandbox institution and product (transactions)
+    req = SandboxPublicTokenCreateRequest(institution_id="ins_109508", initial_products=[Products("transactions")])
+    resp = client.sandbox_public_token_create(req)
+    return resp.public_token
+
+def exchange_public_token(client, public_token):
+    req = ItemPublicTokenExchangeRequest(public_token=public_token)
+    resp = client.item_public_token_exchange(req)
+    return resp.access_token
+
+def fetch_transactions_from_plaid(client, access_token, days_back=90):
+    start_date = (datetime.utcnow().date() - timedelta(days=days_back)).isoformat()
+    end_date = datetime.utcnow().date().isoformat()
+    req = TransactionsGetRequest(access_token=access_token, start_date=start_date, end_date=end_date, options=None)
+    resp = client.transactions_get(req)
+    transactions = resp.transactions
+    # convert to serializable dicts
+    txs = [t.to_dict() for t in transactions]
+    return txs
+
+# ---------------------------
+# AI helper (Gemini) - optional
+# ---------------------------
+def call_gemini_prompt(prompt_text):
+    if not GEMINI_AVAILABLE or not GENAI_API_KEY:
+        raise RuntimeError("Gemini not configured. Install google.generativeai and set GENAI_API_KEY.")
+    genai.configure(api_key=GENAI_API_KEY)
+    model = genai.GenerativeModel("gemini-2.5-flash")
+    resp = model.generate_content(prompt_text)
+    return resp.text
+
+# ---------------------------
+# UI: Header
+# ---------------------------
+left_top, right_top = st.columns([3,1])
+with left_top:
+    st.markdown("<div style='display:flex;gap:12px;align-items:center'>", unsafe_allow_html=True)
+    st.markdown("<div style='font-size:22px;font-weight:700'>💸 Budget Buddy — Vibe</div>", unsafe_allow_html=True)
+    st.markdown("<div class='muted'>Futuristic fintech split-view • Plaid sandbox + optional AI</div>", unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+with right_top:
+    lottie = load_lottie_url("https://assets10.lottiefiles.com/packages/lf20_pNx6yH.json")
+    if lottie:
+        st_lottie(lottie, height=90, key="header_lottie")
+
+st.markdown("<hr>", unsafe_allow_html=True)
+
+# ---------------------------
+# Sidebar controls
+# ---------------------------
+st.sidebar.header("Connections & Upload")
+st.sidebar.markdown("Use Plaid sandbox (requires test keys in Keys.env) or upload local JSON/CSV output from the backend script.")
+use_plaid = st.sidebar.checkbox("Enable Plaid sandbox fetch (uses Keys.env)", value=False)
+upload_mode = st.sidebar.radio("Upload fallback", ["None", "Upload CSV", "Upload JSON", "Paste JSON"], index=0)
+uploaded_file = None
+pasted_json = None
+if upload_mode == "Upload CSV":
+    uploaded_file = st.sidebar.file_uploader("Select CSV", type=["csv"])
+elif upload_mode == "Upload JSON":
+    uploaded_file = st.sidebar.file_uploader("Select JSON", type=["json"])
+elif upload_mode == "Paste JSON":
+    pasted_json = st.sidebar.text_area("Paste transactions JSON here", height=200)
+
+st.sidebar.markdown("---")
+monthly_budget = st.sidebar.number_input("Monthly budget ($)", value=2000.0, min_value=0.0, step=50.0)
+st.sidebar.markdown("---")
+st.sidebar.markdown("AI (optional)")
+use_gemini = st.sidebar.checkbox("Call Gemini AI (requires GENAI_API_KEY)", value=False)
+st.sidebar.markdown("Keep Keys.env local — do not paste API keys into chat.")
+
+# ---------------------------
+# Data loading
+# ---------------------------
+raw_transactions = []
+plaid_error = None
+
+if use_plaid:
+    try:
+        plaid_client = init_plaid_client()
+        pub = create_sandbox_public_token(plaid_client)
+        access = exchange_public_token(plaid_client, pub)
+        txs = fetch_transactions_from_plaid(plaid_client, access, days_back=90)
+        raw_transactions = txs
+        st.sidebar.success(f"Fetched {len(txs)} transactions from Plaid sandbox.")
+    except Exception as e:
+        plaid_error = e
+        st.sidebar.error(f"Plaid fetch failed: {e}")
+
+# fallback to upload or paste
+if upload_mode == "Upload CSV" and uploaded_file:
+    try:
+        dfu = pd.read_csv(uploaded_file)
+        raw_transactions = dfu.to_dict(orient="records")
+        st.sidebar.success("Loaded CSV.")
+    except Exception as e:
+        st.sidebar.error(f"CSV parse error: {e}")
+
+if upload_mode == "Upload JSON" and uploaded_file:
+    try:
+        raw_transactions = json.load(uploaded_file)
+        st.sidebar.success("Loaded JSON.")
+    except Exception as e:
+        st.sidebar.error(f"JSON parse error: {e}")
+
+if upload_mode == "Paste JSON" and pasted_json:
+    try:
+        raw_transactions = json.loads(pasted_json)
+        st.sidebar.success("Pasted JSON loaded.")
+    except Exception as e:
+        st.sidebar.error(f"Invalid JSON paste: {e}")
+
+# If still empty, show demo load button
+if not raw_transactions:
+    if st.sidebar.button("Load demo synthetic data"):
+        demo = []
+        today = datetime.utcnow().date()
+        cats = ["Groceries","Dining Out","Transport","Entertainment","Subscriptions","Other","Rent"]
+        merchants = ["ShopMart","Cafe Loft","UberX","Cinema","Spotify","Local Market","Landlord"]
+        rng = pd.date_range(end=today, periods=90)
+        np.random.seed(42)
+        for d in rng:
+            for _ in range(np.random.poisson(0.6) if hasattr(np.random, "poisson") else (1 if np.random.rand()>0.6 else 0)):
+                cat = np.random.choice(cats, p=[0.18,0.12,0.12,0.08,0.05,0.27,0.18])
+                amt = round(abs(np.random.normal(40 if cat!="Rent" else 1200, 30)),2)
+                m = np.random.choice(merchants)
+                demo.append({"date": d.date().isoformat(), "merchant_name": m, "category": cat, "amount": float(amt)})
+        raw_transactions = demo
+        st.sidebar.success("Loaded demo transactions.")
+
+# Normalize and DataFrame
+normalized = normalize_transactions(raw_transactions)
+df = pd.DataFrame([{
+    "date": (t["date"] if t["date"] is None else pd.to_datetime(t["date"])),
+    "merchant": t["merchant_name"],
+    "category": t["category"],
+    "amount": t["amount"]
+} for t in normalized])
+
+# ---------------------------
+# LEFT: Dashboard visuals
+# ---------------------------
+left, right = st.columns([3,1.05])
+
+with left:
+    st.markdown("<div class='glass'>", unsafe_allow_html=True)
+    st.markdown("<h3 style='margin:0'>Overview</h3>", unsafe_allow_html=True)
+    st.markdown("<div class='muted'>Interactive charts & breakdowns</div>", unsafe_allow_html=True)
+
+    if not df.empty:
+        # KPIs row
+        total_spent = df['amount'].sum()
+        this_month = df[df['date'].dt.to_period('M') == pd.Timestamp.today().to_period('M')]['amount'].sum()
+        avg_daily = df.groupby(df['date'].dt.date)['amount'].sum().mean()
+        k1,k2,k3,k4 = st.columns([1.4,1,1,1])
+        k1.metric("This month", currency(this_month))
+        k2.metric("Total (history)", currency(total_spent))
+        k3.metric("Avg daily", currency(avg_daily))
+        used = min(1.0, this_month / max(1.0, monthly_budget))
+        k4.progress(used)
+        k4.markdown(f"**{int(used*100)}%** of budget")
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+
+        # Time series with rolling average
+        ts = df.groupby(pd.Grouper(key='date', freq='D'))['amount'].sum().reset_index().fillna(0)
+        ts['rolling'] = ts['amount'].rolling(7, min_periods=1).mean()
+        fig_ts = go.Figure()
+        fig_ts.add_trace(go.Bar(x=ts['date'], y=ts['amount'], name='Daily', marker_color='rgba(110, 92, 255, 0.7)'))
+        fig_ts.add_trace(go.Scatter(x=ts['date'], y=ts['rolling'], name='7-day avg', line=dict(color='#00F5A0', width=3)))
+        fig_ts.update_layout(margin=dict(l=0,r=0,t=20,b=0), template="plotly_dark", height=320)
+        st.plotly_chart(fig_ts, use_container_width=True)
+
+        st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+
+        # Category + donut
+        cat_sum = df.groupby("category")['amount'].sum().sort_values(ascending=False)
+        c1, c2 = st.columns([1.6,1])
+        with c1:
+            fig_bar = px.bar(x=cat_sum.index, y=cat_sum.values, labels={'x':'Category','y':'Amount'}, template='plotly_dark')
+            fig_bar.update_traces(marker_color='rgb(108,92,255)')
+            fig_bar.update_layout(margin=dict(l=0,r=0,t=20,b=0), height=300)
+            st.plotly_chart(fig_bar, use_container_width=True)
+        with c2:
+            fig_pie = px.pie(names=cat_sum.index, values=cat_sum.values, hole=0.55)
+            fig_pie.update_traces(textinfo='percent+label')
+            fig_pie.update_layout(margin=dict(l=0,r=0,t=20,b=0), template='plotly_dark', height=300)
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        st.markdown("<hr>", unsafe_allow_html=True)
+
+        # Transaction table & filters
+        st.markdown("<h4>Transactions</h4>", unsafe_allow_html=True)
+        t1, t2, t3 = st.columns([2,1,1])
+        txt = t1.text_input("Search merchant", value="")
+        cat_filter = t2.multiselect("Category", options=sorted(df['category'].dropna().unique()), default=[])
+        dr = t3.date_input("Date range", value=[df['date'].min().date(), df['date'].max().date()])
+
+        fdf = df.copy()
+        if txt:
+            fdf = fdf[fdf['merchant'].str.contains(txt, case=False, na=False)]
+        if cat_filter:
+            fdf = fdf[fdf['category'].isin(cat_filter)]
+        if dr and len(dr) == 2:
+            s,e = dr
+            fdf = fdf[(fdf['date'].dt.date >= s) & (fdf['date'].dt.date <= e)]
+
+        st.dataframe(fdf.sort_values('date', ascending=False).reset_index(drop=True), height=300)
+        st.download_button("Download filtered CSV", fdf.to_csv(index=False).encode('utf-8'), file_name="transactions_filtered.csv")
+    else:
+        st.markdown("<div class='muted'>No transaction data loaded — use Plaid or upload to begin demo.</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ---------------------------
+# RIGHT: AI / Controls (split view)
+# ---------------------------
+with right:
+    st.markdown("<div class='glass'>", unsafe_allow_html=True)
+    st.markdown("<h3 style='margin:0'>AI Insights & Controls</h3>", unsafe_allow_html=True)
+    st.markdown("<div class='muted'>Prompt builder, immediate suggestions, and optimization actions</div>", unsafe_allow_html=True)
+
+    # Show computed spending by merchant (backend-match)
+    spending_by_merchant = compute_spending_by_merchant(normalized)
+    st.markdown("**Spending by merchant (computed):**")
+    st.write(spending_by_merchant)
+
+    # Build prompt exactly like backend
+    prompt_text = f"""
+Spending summary:
+The spending by category is: {spending_by_merchant}.
+
+1. Identify spending patterns.
+2. Suggest 5 concrete ways to reduce or optimize spending.
+3. Estimate potential monthly savings.
+"""
+    st.markdown("**Generated prompt**")
+    st.code(prompt_text, language="text")
+
+    # Payload (raw transactions to match backend)
+    payload = {"transactions": [t["_raw"] if "_raw" in t else t for t in normalized], "monthly_budget": monthly_budget}
+    st.markdown("**Payload preview**")
+    st.json({"transactions_count": len(payload["transactions"]), "monthly_budget": monthly_budget})
+
+    # Buttons: call Gemini (if configured) or simulate
+    if use_gemini and GEMINI_AVAILABLE and GENAI_API_KEY:
+        if st.button("Call Gemini AI (live)"):
+            try:
+                result = call_gemini_prompt(prompt_text)
+                st.success("Gemini returned a response")
+                st.markdown(result)
+            except Exception as e:
+                st.error(f"Gemini call failed: {e}")
+    else:
+        if st.button("Simulate AI suggestions"):
+            # Simple heuristic suggestions (same as earlier backend mock)
+            total = sum(t.get("amount", 0) for t in normalized)
+            by_cat_df = pd.DataFrame(normalized).groupby("category")["amount"].sum().sort_values(ascending=False)
+            top_cat = by_cat_df.index[0] if len(by_cat_df)>0 else None
+            sim = [
+                {"title": "Budget check", "detail": f"Total spending in dataset: {currency(total)}", "score": 0.95},
+                {"title": f"Top Category: {top_cat}", "detail": f"Consider trimming {top_cat} by 10-20% to save money.", "score": 0.86},
+                {"title": "Subscriptions audit", "detail": "Review recurring subscriptions and cancel unused ones.", "score": 0.72},
+                {"title": "Round-up saving", "detail": "Enable round-up micro-savings for automatic saving.", "score": 0.42},
+                {"title": "Action Plan", "detail": "Cook at home twice a week + cancel 1 subscription = est. $120/month saved.", "score": 0.88}
+            ]
+            for s in sim:
+                st.markdown(f"**{s['title']}**")
+                st.markdown(s["detail"])
+                st.progress(min(1.0, s["score"]))
+                st.markdown("---")
+
+    # Quick optimization sliders (interactive UI)
+    st.markdown("### Quick optimizer")
+    optimize_cat = st.selectbox("Select category to optimize", options=["Dining Out", "Entertainment", "Groceries", "Subscriptions", "Other"], index=0)
+    reduce_pct = st.slider("Reduce by (%)", min_value=0, max_value=50, value=10, step=5)
+    if st.button("Estimate Savings"):
+        # estimate based on category sum
+        cat_map = pd.DataFrame(normalized).groupby("category")["amount"].sum().to_dict()
+        base = cat_map.get(optimize_cat, 0.0)
+        estimated = base * (reduce_pct/100.0)
+        st.success(f"Estimated monthly savings if you reduce {optimize_cat} by {reduce_pct}%: {currency(estimated)}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+st.markdown("<hr>", unsafe_allow_html=True)
+st.markdown("<div style='text-align:center;color:#9aa8c2'>Made with ♥ by Budget Buddy — Futuristic Fintech • Demo Mode</div>", unsafe_allow_html=True)

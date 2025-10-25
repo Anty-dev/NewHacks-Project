@@ -8,10 +8,6 @@ from plaid.api_client import ApiClient
 from plaid.configuration import Configuration
 
 
-
-PLAID_CLIENT_ID="68fd03e0c77fc80023aaf819"
-PLAID_APIKEY="6c04d90516515b7a6e344107ae852d"
-
 load_dotenv()
 
 client_id = os.getenv("PLAID_CLIENT_ID")

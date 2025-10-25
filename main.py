@@ -12,15 +12,13 @@ from plaid.model.sandbox_public_token_create_request import SandboxPublicTokenCr
 from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
 
 
-<<<<<<< HEAD
 
 dotenv_path = Path("Keys.env")
 load_dotenv(dotenv_path)
 
 ## Section 1
-=======
+
 load_dotenv()
->>>>>>> 57fef449755318adc75d29fd0a28556d97046146
 
 client_id = os.getenv("PLAID_CLIENT_ID")
 secret = os.getenv("PLAID_APIKEY")
@@ -32,13 +30,11 @@ configuration = Configuration(
 )
 
 client = plaid_api.PlaidApi(ApiClient(configuration))
-<<<<<<< HEAD
+
 
 # print("test")
 #print("client_id:", client_id)
 # print("secret:", secret)
-
-#report section 1 works as intended
 
 ## Section 2
 
@@ -52,8 +48,6 @@ response = client.sandbox_public_token_create(request)
 public_token = response.public_token
 #print("Public token:", public_token)
 
-#Report: Im pretty sure this works as intended
-
 # #section 3
 
 from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
@@ -63,7 +57,6 @@ exchange_response = client.item_public_token_exchange(exchange_request)
 access_token = exchange_response.access_token
 # #print("Access token:", access_token)
 
-# # works i think again
 
 # #Section 4
 
@@ -82,7 +75,7 @@ response = client.transactions_get(request)
 
 from datetime import date
 import json
-transactions = response.transactions  # list of transaction objects
+transactions = response.transactions  
 transactions_dict = [t.to_dict() for t in transactions]
 
 print(f"Fetched {len(transactions)} transactions")
@@ -93,15 +86,13 @@ def convert_dates(obj):
     elif isinstance(obj, list):
         return [convert_dates(i) for i in obj]
     elif isinstance(obj, date):
-        return obj.isoformat()  # convert date to string
+        return obj.isoformat()  
     else:
         return obj
 
 
 transactions_serializable = convert_dates(transactions_dict)
 
-
-#Report: Code works above tis point 
 
 #Section 5 data cleaning
 
@@ -122,7 +113,7 @@ transactions_to_print = convert_dates(cleaned_transactions)
 #print(json.dumps(transactions_to_print, indent=2))
 
 
-#keyG = os.getenv('GEMINI')
+
 genai.configure(api_key='AIzaSyAQBiq41h0mnmgbZpeUEHzhV0xOlQOzt_g')
 
 def total_spending(transactions_to_print):
@@ -154,5 +145,4 @@ response = model.generate_content(prompt)
 print("The response is ")
 print("---------------------")
 print(response.text)
-=======
->>>>>>> 57fef449755318adc75d29fd0a28556d97046146
+
